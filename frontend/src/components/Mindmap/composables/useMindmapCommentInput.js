@@ -1,6 +1,7 @@
 // composables/useMindmapCommentInput.js
 import { call } from "frappe-ui"
 import { computed, ref, watch } from "vue"
+import { generateUUID } from "@/utils/uuid"
 
 /**
  * =========================
@@ -136,7 +137,7 @@ export function useMindmapCommentInput({
     const { nodeId, sessionIndex } = parseGroupKey(activeGroupKey.value)
     if (!nodeId || !sessionIndex) return
 
-    const node_key = activeNode?.value?.node_key || crypto.randomUUID()
+    const node_key = activeNode?.value?.node_key || generateUUID()
 
     const payload = {
       text: finalHTML,

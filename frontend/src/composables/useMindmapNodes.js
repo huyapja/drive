@@ -1,6 +1,7 @@
 import { computeInsertAfterAnchor, computeInsertAsLastChild } from '@/components/Mindmap/components/engine/nodeOrderEngine'
 import { scrollToNode, scrollToNodeMinimal, scrollToNodeVertical } from '@/utils/d3mindmap/viewUtils'
 import { toast } from '@/utils/toasts'
+import { generateUUID } from '@/utils/uuid'
 import { nextTick } from 'vue'
 
 export function useMindmapNodes({
@@ -114,7 +115,7 @@ export function useMindmapNodes({
 
     const newNode = {
       id: newNodeId,
-      node_key: crypto.randomUUID(),
+      node_key: generateUUID(),
       created_at: Date.now(), 
       data: {
         label: 'Nhánh mới',
@@ -261,7 +262,7 @@ export function useMindmapNodes({
 
     const newNode = {
       id: newNodeId,
-      node_key: crypto.randomUUID(),
+      node_key: generateUUID(),
       created_at: Date.now(), 
       data: {
         label: 'Nhánh mới',

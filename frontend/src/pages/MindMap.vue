@@ -316,6 +316,7 @@ import { useRecentFiles } from "@/composables/useRecentFiles"
 import { setBreadCrumbs } from "@/utils/files"
 import { uploadImageToMindmap } from '@/utils/mindmapImageUpload'
 import { toast } from "@/utils/toasts"
+import { generateUUID } from "@/utils/uuid"
 import { call, createResource } from "frappe-ui"
 import { computed, defineProps, inject, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from "vue"
 import { useStore } from "vuex"
@@ -5585,7 +5586,7 @@ async function addChildToNodeTextMode(payload) {
 
       const newNode = {
         id: newNodeId,
-        node_key: crypto.randomUUID(),
+        node_key: generateUUID(),
         created_at: Date.now(),
         data: {
           parentId,
@@ -5645,7 +5646,7 @@ async function addChildToNodeTextMode(payload) {
 
       const newNode = {
         id: newNodeId,
-        node_key: crypto.randomUUID(),
+        node_key: generateUUID(),
         created_at: Date.now(), 
         data: {
           parentId,

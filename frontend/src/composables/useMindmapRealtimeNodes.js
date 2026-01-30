@@ -22,6 +22,41 @@ export function useMindmapRealtimeNodes({
   saveSnapshot,
   applyStrikethroughToTitle
 }) {
+  
+  /**
+   * Helper function để render an toàn - chỉ render nếu không có node nào đang được edit
+   * @param {Function} renderer - Renderer instance
+   * @param {boolean} force - Force render ngay cả khi có node đang được edit
+   * @returns {boolean} true nếu đã render, false nếu bỏ qua
+   */
+  const safeRender = (renderer, force = false) => {
+    if (!renderer) return false
+    
+    const hasAnyNodeBeingEdited = !!editingNode.value
+    
+    if (hasAnyNodeBeingEdited && !force) {
+      console.log('⚠️ Bỏ qua render vì có node đang được edit:', editingNode.value)
+      return false
+    }
+    
+    renderer.render()
+    return true
+  }
+
+  // ⚠️ CRITICAL: Helper function để update renderer data mà KHÔNG gọi render()
+  // Vì setData() tự động gọi render() và sẽ unmount editor
+  const updateRendererDataWithoutRender = (renderer, nodes, edges, nodeCreationOrder) => {
+    if (!renderer) return
+    
+    // Update data trực tiếp mà không gọi setData()
+    renderer.nodes = nodes || renderer.nodes
+    renderer.edges = edges || renderer.edges
+    if (nodeCreationOrder) {
+      renderer.options.nodeCreationOrder = nodeCreationOrder
+    }
+    
+    console.log('⚠️ Đã update renderer data mà KHÔNG gọi setData/render để tránh unmount editor')
+  }
 
   /**
    * Handle realtime nodes deleted
@@ -77,10 +112,18 @@ export function useMindmapRealtimeNodes({
     
     const renderer = typeof d3Renderer === 'function' ? d3Renderer() : d3Renderer?.value || d3Renderer
     if (renderer) {
-      nextTick(() => {
-        renderer.setData(newNodes, newEdges, nodeCreationOrder.value)
-        renderer.render()
-      })
+      const hasAnyNodeBeingEdited = !!editingNode.value
+      
+      if (hasAnyNodeBeingEdited) {
+        // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+        // Vì setData() tự động gọi render() và sẽ unmount editor
+        updateRendererDataWithoutRender(renderer, newNodes, newEdges, nodeCreationOrder.value)
+      } else {
+        nextTick(() => {
+          renderer.setData(newNodes, newEdges, nodeCreationOrder.value)
+          safeRender(renderer)
+        })
+      }
     }
   }
 
@@ -283,8 +326,36 @@ export function useMindmapRealtimeNodes({
         
         // Lấy edges mới từ elements.value (đã được update ở trên)
         const currentEdges = elements.value.filter(el => el.source && el.target)
-        renderer.setData(updatedNodes, currentEdges, nodeCreationOrder.value)
-        renderer.render()
+        
+        // ⚠️ CRITICAL: Kiểm tra xem có node đang được edit không
+        const hasAnyNodeBeingEdited = !!editingNode.value
+        
+        if (hasAnyNodeBeingEdited) {
+          // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+          // Vì setData() tự động gọi render() và sẽ unmount editor
+          updateRendererDataWithoutRender(renderer, updatedNodes, currentEdges, nodeCreationOrder.value)
+          
+          // Update d3Node.data cho các nodes được update
+          remoteNodeUpdates.forEach(updatedNode => {
+            const d3Node = renderer.nodes.find(n => n.id === updatedNode.id)
+            if (d3Node) {
+              if (updatedNode.data?.label) {
+                d3Node.data.label = updatedNode.data.label
+              }
+              if (updatedNode.data?.completed !== undefined) {
+                d3Node.data.completed = updatedNode.data.completed
+              }
+              if (updatedNode.data?.rect) {
+                d3Node.data.rect = updatedNode.data.rect
+                d3Node.data.fixedWidth = updatedNode.data.rect.width
+                d3Node.data.fixedHeight = updatedNode.data.rect.height
+              }
+            }
+          })
+        } else {
+          renderer.setData(updatedNodes, currentEdges, nodeCreationOrder.value)
+          safeRender(renderer)
+        }
         
         // ⚠️ CRITICAL: Đợi render xong, sau đó mount editor cho các nodes mới
         if (newNodes.length > 0) {
@@ -385,7 +456,10 @@ export function useMindmapRealtimeNodes({
       // ⚠️ FIX: Khai báo các biến trước khi sử dụng
       const isNodeBeingEdited = remoteNode.id === editingNodeId
       const isNodeSelected = remoteNode.id === selectedNodeId && remoteNode.id !== editingNodeId
-      const hasLocalChanges = changedNodeIds.value.has(remoteNode.id)
+      // ⚠️ CRITICAL FIX: Chỉ chặn update nếu node đang được CHÍNH USER ĐÓ edit
+      // Không chặn chỉ vì node có trong changedNodeIds nếu node đó không phải là node đang được edit
+      // Vì user có thể đã click vào nhiều node nhưng chỉ edit 1 node
+      const hasLocalChanges = changedNodeIds.value.has(remoteNode.id) && isNodeBeingEdited
       
       // ⚠️ FIX: Kiểm tra xem có chỉ thay đổi completed status không
       const localNode = nodes.value.find(n => n.id === remoteNode.id)
@@ -395,9 +469,11 @@ export function useMindmapRealtimeNodes({
       
       // ⚠️ FIX: Luôn cho phép update completed status, ngay cả khi node đang được selected/focused
       // Vì completed không ảnh hưởng đến label đang được edit
-      const shouldUpdateElements = !isNodeBeingEdited && !isNodeSelected && !hasLocalChanges
+      // ⚠️ CRITICAL: Chỉ chặn update nếu node đang được LOCAL USER edit/select
+      // Nếu node khác (ví dụ: user A edit node 1, user B edit node 2), thì vẫn update bình thường
+      const shouldUpdateElements = !isNodeBeingEdited && !isNodeSelected
       const shouldUpdateCompletedOnly = remoteNode.data?.completed !== undefined && 
-        (isNodeBeingEdited || isNodeSelected || hasLocalChanges)
+        (isNodeBeingEdited || isNodeSelected)
       
       // ⚠️ CRITICAL: Phải update elements.value (không phải nodes.value vì nó là computed)
       const elementIndex = elements.value.findIndex(el => el.id === remoteNode.id && !el.source && !el.target)
@@ -517,52 +593,11 @@ export function useMindmapRealtimeNodes({
         }
       }
       
-      // ⚠️ FIX: Nếu có node khác đang được local user edit, không render để tránh blur
-      // Chỉ render nếu không có node nào đang được edit
-      if (editingNodeId && editingNodeId !== remoteNode.id) {
-        console.log('⚠️ Có node khác đang được LOCAL USER edit, bỏ qua render để không gián đoạn user')
-        
-        // ⚠️ FIX: Vẫn update completed status và d3Node.data cho node này
-        if (renderer) {
-          const d3Node = renderer.nodes.find(n => n.id === remoteNode.id)
-          if (d3Node) {
-            // Update label nếu không đang được edit
-            if (!isNodeSelected && !hasLocalChanges) {
-              d3Node.data.label = remoteNode.data.label
-            }
-            
-            // Update completed status
-            if (remoteNode.data?.completed !== undefined) {
-              const oldCompleted = d3Node.data?.completed || false
-              d3Node.data.completed = remoteNode.data.completed
-              
-              if (oldCompleted !== remoteNode.data.completed && applyStrikethroughToTitle) {
-                nextTick(() => {
-                  setTimeout(() => {
-                    const editorInstance = renderer.getEditorInstance?.(remoteNode.id)
-                    if (editorInstance && !editorInstance.isDestroyed) {
-                      if (!renderer.isUpdatingStyle) {
-                        renderer.isUpdatingStyle = new Set()
-                      }
-                      renderer.isUpdatingStyle.add(remoteNode.id)
-                      
-                      applyStrikethroughToTitle(editorInstance, remoteNode.data.completed)
-                      
-                      setTimeout(() => {
-                        if (renderer.isUpdatingStyle) {
-                          renderer.isUpdatingStyle.delete(remoteNode.id)
-                        }
-                      }, 100)
-                    }
-                  }, 100)
-                })
-              }
-            }
-          }
-        }
-        
-        return // Không render để tránh blur editor đang được edit
-      }
+      // ⚠️ CRITICAL FIX: Chỉ bỏ qua render nếu CHÍNH node này đang được local user edit
+      // KHÔNG bỏ qua render nếu node khác đang được edit (ví dụ: user A edit node 1, user B edit node 2)
+      // Vì mỗi node độc lập, việc edit node này không nên chặn update node khác
+      // Logic này đã được xử lý ở trên với isNodeBeingEdited, không cần check lại ở đây
+      // Code sẽ tiếp tục render node này nếu nó không phải là node đang được edit
       
       if (payload.edge) {
         const remoteEdge = payload.edge
@@ -737,19 +772,26 @@ export function useMindmapRealtimeNodes({
             }
           }
           
-          // ⚠️ FIX: Kiểm tra lại xem có node nào đang được edit không trước khi render
-          // (Có thể có node mới được thêm vào sau khi kiểm tra ở trên)
+          // ⚠️ CRITICAL FIX: Chỉ bỏ qua render nếu CHÍNH node này đang được edit
+          // KHÔNG bỏ qua render nếu node khác đang được edit
+          // Vì mỗi node độc lập, việc edit node này không nên chặn render node khác
           const currentEditingNodeId = editingNode.value
-          if (currentEditingNodeId) {
-            console.log('⚠️ Có node đang được LOCAL USER edit, chỉ update data, bỏ qua render để không gián đoạn user')
+          const isThisNodeBeingEdited = currentEditingNodeId === remoteNode.id
+          
+          if (isThisNodeBeingEdited) {
+            console.log('⚠️ Node này đang được LOCAL USER edit, chỉ update data, KHÔNG gọi setData để tránh unmount editor:', remoteNode.id)
             
-            // ⚠️ FIX: Vẫn update d3Node.data cho node mới, nhưng không render
-            // Node sẽ được render khi user blur editor
+            // ⚠️ CRITICAL: KHÔNG gọi setData() vì nó sẽ trigger render() và unmount editor
+            // Chỉ update d3Node.data trực tiếp
             if (elementIndex === -1) {
-              // Node mới: cần thêm vào renderer.nodes nhưng không render
-              // Chỉ update setData để node có trong data, nhưng không gọi render()
-              renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
-              console.log('⚠️ Node mới được thêm vào data nhưng không render vì có node đang được edit')
+              // Node mới: thêm trực tiếp vào renderer.nodes mà không gọi setData()
+              // Vì setData() sẽ trigger render() và unmount editor
+              const newNode = { ...remoteNode }
+              if (!renderer.nodes) {
+                renderer.nodes = []
+              }
+              renderer.nodes.push(newNode)
+              console.log('⚠️ Node mới được thêm trực tiếp vào renderer.nodes (không gọi setData) vì đang được edit:', remoteNode.id)
             } else {
               // Node đã tồn tại: chỉ update d3Node.data
               const d3Node = renderer.nodes.find(n => n.id === remoteNode.id)
@@ -760,27 +802,99 @@ export function useMindmapRealtimeNodes({
                 if (remoteNode.data?.completed !== undefined) {
                   d3Node.data.completed = remoteNode.data.completed
                 }
+                if (remoteNode.data?.rect) {
+                  d3Node.data.rect = remoteNode.data.rect
+                  d3Node.data.fixedWidth = remoteNode.data.rect.width
+                  d3Node.data.fixedHeight = remoteNode.data.rect.height
+                }
               }
             }
             
             return // Không render để tránh blur editor đang được edit
           }
           
-          renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
-          renderer.render()
+          // ⚠️ CRITICAL FIX: Chỉ render nếu KHÔNG có node nào đang được edit
+          // Vì render() sẽ re-render toàn bộ mindmap, làm unmount tất cả editor
+          // Nếu có node đang được edit, chỉ update d3Node.data và set content thủ công
+          const hasAnyNodeBeingEdited = !!editingNode.value
           
-          // ⚠️ CRITICAL: Đợi render xong trước khi xử lý editor
-          // Render sẽ mount Vue component vào container
+          if (hasAnyNodeBeingEdited) {
+            console.log('⚠️ Có node đang được edit, chỉ update d3Node.data và set content thủ công, KHÔNG gọi setData để tránh unmount editor:', {
+              editingNodeId: editingNode.value,
+              updatingNodeId: remoteNode.id
+            })
+            
+            // ⚠️ CRITICAL: Chỉ update d3Node.data trực tiếp, KHÔNG gọi setData()
+            // Vì setData() có thể trigger re-render và unmount editor
+            let d3Node = renderer.nodes.find(n => n.id === remoteNode.id)
+            
+            // Nếu node chưa tồn tại trong renderer.nodes, thêm vào trực tiếp
+            if (!d3Node && elementIndex === -1) {
+              if (!renderer.nodes) {
+                renderer.nodes = []
+              }
+              d3Node = { ...remoteNode }
+              renderer.nodes.push(d3Node)
+              console.log('⚠️ Node mới được thêm trực tiếp vào renderer.nodes (không gọi setData) vì có node khác đang được edit:', remoteNode.id)
+            }
+            
+            if (d3Node) {
+              if (!isNodeBeingEdited && !isNodeSelected) {
+                d3Node.data.label = remoteNode.data?.label || d3Node.data.label
+              }
+              if (remoteNode.data?.completed !== undefined) {
+                d3Node.data.completed = remoteNode.data.completed
+              }
+              if (remoteNode.data?.rect) {
+                d3Node.data.rect = remoteNode.data.rect
+                d3Node.data.fixedWidth = remoteNode.data.rect.width
+                d3Node.data.fixedHeight = remoteNode.data.rect.height
+              }
+            }
+            
+            // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+            // Vì setData() có thể trigger re-render và unmount editor
+            // Chỉ update d3Node.data trực tiếp và set content cho editor
+            
+            // Không gọi render() để tránh unmount editor
+            // Chỉ set content cho editor của node này (sẽ được xử lý ở phần dưới)
+            // ⚠️ CRITICAL: Vẫn cần đợi một chút để đảm bảo d3Node.data đã được update
+            // trước khi set content cho editor
+          } else {
+            // Không có node nào đang được edit, có thể render an toàn
+            renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
+            safeRender(renderer)
+          }
+          
+          // ⚠️ CRITICAL: Đợi render xong (nếu có render) hoặc đợi một chút (nếu không render)
+          // để đảm bảo editor sẵn sàng trước khi set content
+          // ⚠️ CRITICAL FIX: Luôn gọi set content, không phụ thuộc vào việc có render hay không
+          // Vì editor đã được mount từ trước, chỉ cần set content mới
+          // ⚠️ FIX: Giảm delay khi không render để set content nhanh hơn
+          const delay = hasAnyNodeBeingEdited ? 50 : 200 // Nếu không render, chỉ đợi 50ms
           nextTick(() => {
             setTimeout(() => {
-              if (isNodeSelected) {
-                const hasLocalChanges = changedNodeIds.value.has(remoteNode.id)
+              // ⚠️ CRITICAL FIX: Chỉ bỏ qua set content nếu CHÍNH node này đang được edit VÀ có thay đổi local
+              // KHÔNG bỏ qua nếu node khác đang được edit
+              // Vì user có thể đã click vào node này trước đó nhưng đang edit node khác
+              // ⚠️ QUAN TRỌNG: Luôn set content cho node không đang được edit để đảm bảo realtime sync
+              if (isNodeBeingEdited) {
+                const hasLocalChanges = changedNodeIds.value.has(remoteNode.id) && isNodeBeingEdited
                 if (hasLocalChanges) {
-                  console.log('⚠️ Node đang được selected và có thay đổi local, bỏ qua update editor content')
+                  console.log('⚠️ Node đang được edit và có thay đổi local, bỏ qua update editor content:', remoteNode.id)
                   return
                 } else {
-                  console.log('✨ Node đang được selected nhưng chưa có thay đổi, cho phép update editor content')
+                  console.log('✨ Node đang được edit nhưng chưa có thay đổi, cho phép update editor content:', remoteNode.id)
                 }
+              } else {
+                // Node không đang được edit, luôn cho phép update content
+                // Đây là trường hợp quan trọng: user A edit node 1, user B edit node 2
+                // Khi user A nhận update về node 2, node 2 không đang được edit → phải set content
+                console.log('✨ [REALTIME] Node không đang được edit, sẽ set content để sync:', {
+                  nodeId: remoteNode.id,
+                  labelPreview: (remoteNode.data?.label || '').substring(0, 50),
+                  editingNodeId: editingNode.value
+                })
               }
               
               // ⚠️ CRITICAL: Đợi editor được mount trước khi set content
@@ -965,10 +1079,12 @@ export function useMindmapRealtimeNodes({
                                 //   setTimeout(retryCheckImages, 300)
                                 // }
                                 
-                                // Nếu container vẫn rỗng, trigger render lại
+                                // Nếu container vẫn rỗng, trigger render lại (chỉ khi không có node đang được edit)
                                 if (!finalContainerHasChildren) {
-                                  console.warn(`[Realtime] ⚠️ Container vẫn rỗng sau khi set content, trigger render lại`)
-                                  renderer.render()
+                                  console.warn(`[Realtime] ⚠️ Container vẫn rỗng sau khi set content, thử render lại`)
+                                  if (!safeRender(renderer)) {
+                                    console.warn(`[Realtime] ⚠️ Không thể render vì có node đang được edit, sẽ retry sau`)
+                                  }
                                 }
                               })
                             })
@@ -1067,10 +1183,30 @@ export function useMindmapRealtimeNodes({
                 }
                 
                 checkAndSetContent().then(editorInstance => {
+                  if (!editorInstance) {
+                    console.warn(`[Realtime] ⚠️ Không thể lấy editor instance cho node ${remoteNode.id} sau ${maxAttempts} lần thử`)
+                    return
+                  }
+                  
+                  if (editorInstance.isDestroyed) {
+                    console.warn(`[Realtime] ⚠️ Editor instance đã bị destroy cho node ${remoteNode.id}`)
+                    return
+                  }
+                  
+                  if (!editorInstance.view) {
+                    console.warn(`[Realtime] ⚠️ Editor instance chưa có view cho node ${remoteNode.id}`)
+                    return
+                  }
+                  
                   if (editorInstance && !editorInstance.isDestroyed && editorInstance.view) {
                     try {
                       // ⚠️ CRITICAL: Đảm bảo label có giá trị trước khi set
+                      // Ưu tiên dùng label từ remoteNode, sau đó từ d3Node.data
                       let labelToSet = remoteNode.data?.label || ''
+                      if (!labelToSet) {
+                        const d3Node = renderer.nodes.find(n => n.id === remoteNode.id)
+                        labelToSet = d3Node?.data?.label || ''
+                      }
                       
                       // ⚠️ FIX: Normalize Unicode để tránh lỗi dấu tiếng Việt
                       if (labelToSet && typeof labelToSet === 'string') {
@@ -1088,6 +1224,14 @@ export function useMindmapRealtimeNodes({
                         console.log(`[Realtime] ⏭️ Content không thay đổi, bỏ qua set content cho node ${remoteNode.id}`)
                         return
                       }
+                      
+                      console.log(`[Realtime] 📝 Sẽ set content cho node ${remoteNode.id}:`, {
+                        labelLength: labelToSet.length,
+                        labelPreview: labelToSet.substring(0, 100),
+                        currentContentLength: currentContent.length,
+                        isNodeBeingEdited,
+                        editingNodeId: editingNode.value
+                      })
                       
                       // ⚠️ FIX: Đếm số lượng ảnh trong content mới
                       const imageCountInNewContent = (labelToSet.match(/<img[^>]*>/gi) || []).length
@@ -1134,8 +1278,10 @@ export function useMindmapRealtimeNodes({
                         
                         // Set content mới (TipTap sẽ tự động wrap ảnh bằng ImageWithWrapper extension)
                         editorInstance.commands.setContent(newContent, false)
+                        console.log(`[Realtime] ✅ Đã set content (nhiều ảnh) cho node ${remoteNode.id}`)
                       } else {
                         editorInstance.commands.setContent(labelToSet, false)
+                        console.log(`[Realtime] ✅ Đã set content cho node ${remoteNode.id}`)
                       }
                       
                       // ⚠️ CRITICAL: Force update editor view để đảm bảo DOM được cập nhật
@@ -1143,6 +1289,18 @@ export function useMindmapRealtimeNodes({
                         requestAnimationFrame(() => {
                           const tr = editorInstance.view.state.tr
                           editorInstance.view.dispatch(tr)
+                          
+                          // ⚠️ CRITICAL: Verify content đã được set đúng
+                          nextTick(() => {
+                            const updatedContent = editorInstance.getHTML()
+                            const contentMatches = updatedContent === labelToSet || updatedContent === newContent
+                            console.log(`[Realtime] 🔍 Verify content sau khi set cho node ${remoteNode.id}:`, {
+                              contentMatches,
+                              expectedLength: labelToSet.length,
+                              actualLength: updatedContent.length,
+                              preview: updatedContent.substring(0, 100)
+                            })
+                          })
                           
                           // // ⚠️ FIX: Chỉ kiểm tra và retry nếu có ảnh
                           // if (imageCountInNewContent > 0) {
@@ -1204,11 +1362,16 @@ export function useMindmapRealtimeNodes({
                       
                       // ⚠️ FIX: Sau khi set content thành công, trigger tính toán lại kích thước ngay
                       // Đảm bảo kích thước node được cập nhật đúng sau khi nhận real-time update
-                      nextTick(() => {
-                        setTimeout(() => {
-                          calculateAndUpdateNodeSize(remoteNode.id)
-                        }, 150)
-                      })
+                      // ⚠️ CRITICAL: Chỉ tính toán lại kích thước nếu node này KHÔNG đang được edit
+                      if (editingNode.value !== remoteNode.id) {
+                        nextTick(() => {
+                          setTimeout(() => {
+                            calculateAndUpdateNodeSize(remoteNode.id)
+                          }, 150)
+                        })
+                      } else {
+                        console.log(`[Realtime] ⚠️ Bỏ qua tính toán lại kích thước cho node ${remoteNode.id} vì node này đang được edit`)
+                      }
                     } catch (err) {
                       console.error(`[Realtime] ❌ Lỗi khi set content cho node ${remoteNode.id}:`, err)
                     }
@@ -1224,6 +1387,12 @@ export function useMindmapRealtimeNodes({
           
           // ⚠️ FIX: Helper function để tính toán lại kích thước và cập nhật
           const calculateAndUpdateNodeSize = (nodeId) => {
+            // ⚠️ CRITICAL: Không tính toán lại kích thước nếu node này đang được edit
+            if (editingNode.value === nodeId) {
+              console.log(`[Realtime] ⚠️ Bỏ qua tính toán lại kích thước cho node ${nodeId} vì node này đang được edit`)
+              return
+            }
+            
             const editorInstance = renderer.getEditorInstance(nodeId)
             if (!editorInstance || editorInstance.isDestroyed) {
               console.warn(`[Realtime] ⚠️ Editor instance không sẵn sàng cho node ${nodeId} khi tính toán size`)
@@ -1367,6 +1536,12 @@ export function useMindmapRealtimeNodes({
           
           // ⚠️ FIX: Helper function để cập nhật kích thước node
           const updateNodeSizeWithNewSize = (nodeId, newSize, rect, fo, nodeGroup, editorContent, borderOffset) => {
+            // ⚠️ CRITICAL: Không cập nhật kích thước nếu node này đang được edit
+            if (editingNode.value === nodeId) {
+              console.log(`[Realtime] ⚠️ Bỏ qua cập nhật kích thước cho node ${nodeId} vì node này đang được edit`)
+              return
+            }
+            
             // ⚠️ CRITICAL: Cập nhật kích thước vào DOM và cache
             renderer.nodeSizeCache.set(nodeId, newSize)
             
@@ -1423,18 +1598,34 @@ export function useMindmapRealtimeNodes({
             requestAnimationFrame(() => {
               requestAnimationFrame(() => {
                 if (renderer) {
-                  renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
+                  const hasAnyNodeBeingEdited = !!editingNode.value
                   
-                  const d3NodeAfterSetData = renderer.nodes.find((n) => n.id === nodeId)
-                  if (d3NodeAfterSetData) {
-                    if (!d3NodeAfterSetData.data) d3NodeAfterSetData.data = {}
-                    d3NodeAfterSetData.data.rect = { width: newSize.width, height: newSize.height }
-                    d3NodeAfterSetData.data.fixedWidth = newSize.width
-                    d3NodeAfterSetData.data.fixedHeight = newSize.height
+                  if (hasAnyNodeBeingEdited) {
+                    // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+                    // Chỉ update d3Node.data trực tiếp
+                    const d3Node = renderer.nodes.find((n) => n.id === nodeId)
+                    if (d3Node) {
+                      if (!d3Node.data) d3Node.data = {}
+                      d3Node.data.rect = { width: newSize.width, height: newSize.height }
+                      d3Node.data.fixedWidth = newSize.width
+                      d3Node.data.fixedHeight = newSize.height
+                    }
+                    console.log(`[Realtime] ⚠️ Đã cập nhật kích thước nhưng KHÔNG gọi setData/render vì có node đang được edit: ${nodeId}`)
+                  } else {
+                    renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
+                    
+                    const d3NodeAfterSetData = renderer.nodes.find((n) => n.id === nodeId)
+                    if (d3NodeAfterSetData) {
+                      if (!d3NodeAfterSetData.data) d3NodeAfterSetData.data = {}
+                      d3NodeAfterSetData.data.rect = { width: newSize.width, height: newSize.height }
+                      d3NodeAfterSetData.data.fixedWidth = newSize.width
+                      d3NodeAfterSetData.data.fixedHeight = newSize.height
+                    }
+                    
+                    if (safeRender(renderer, false)) {
+                      console.log(`[Realtime] ✅ Đã cập nhật kích thước và render lại cho node ${nodeId}: ${newSize.width}x${newSize.height}`)
+                    }
                   }
-                  
-                  renderer.render(true)
-                  console.log(`[Realtime] ✅ Đã cập nhật kích thước và render lại cho node ${nodeId}: ${newSize.width}x${newSize.height}`)
                 }
               })
             })
@@ -1443,6 +1634,12 @@ export function useMindmapRealtimeNodes({
           // Code để xử lý size calculation sau khi editor đã được mount và content đã được set
           // Đợi đủ lâu để đảm bảo editor đã được mount và content đã được set (mount editor mất ~100ms + setContent)
           setTimeout(() => {
+            // ⚠️ CRITICAL: Không tính toán lại kích thước nếu node này đang được edit
+            if (editingNode.value === remoteNode.id) {
+              console.log(`[Realtime] ⚠️ Bỏ qua tính toán lại kích thước (setTimeout) cho node ${remoteNode.id} vì node này đang được edit`)
+              return
+            }
+            
             const editorInstance = renderer.getEditorInstance(remoteNode.id)
             if (editorInstance && !editorInstance.isDestroyed) {
               try {
@@ -1616,11 +1813,28 @@ export function useMindmapRealtimeNodes({
                                       renderer.positions.delete(remoteNode.id)
                                     }
                                     
-                                    // setData lại với nodes.value đã update, sau đó render
+                                    // ⚠️ CRITICAL: Kiểm tra xem có node đang được edit không
                                     requestAnimationFrame(() => {
                                       if (renderer) {
-                                        renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
-                                        renderer.render(true)
+                                        const hasAnyNodeBeingEdited = !!editingNode.value
+                                        
+                                        if (hasAnyNodeBeingEdited) {
+                                          // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+                                          // Chỉ update d3Node.data trực tiếp
+                                          const d3Node = renderer.nodes.find((n) => n.id === remoteNode.id)
+                                          if (d3Node) {
+                                            if (!d3Node.data) d3Node.data = {}
+                                            d3Node.data.rect = { width: newSize.width, height: newSize.height }
+                                            d3Node.data.fixedWidth = newSize.width
+                                            d3Node.data.fixedHeight = newSize.height
+                                          }
+                                          console.log(`[Realtime] ⚠️ Đã cập nhật size nhưng KHÔNG gọi setData/render vì có node đang được edit: ${remoteNode.id}`)
+                                        } else {
+                                          renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
+                                          if (safeRender(renderer, false)) {
+                                            console.log(`[Realtime] ✅ Đã cập nhật size và render lại cho node ${remoteNode.id}: ${newSize.width}x${newSize.height}`)
+                                          }
+                                        }
                                       }
                                     })
                                   }, 20)
@@ -1694,11 +1908,28 @@ export function useMindmapRealtimeNodes({
                               renderer.positions.delete(remoteNode.id)
                             }
                             
-                            // setData lại với nodes.value đã update, sau đó render
+                            // ⚠️ CRITICAL: Kiểm tra xem có node đang được edit không
                             requestAnimationFrame(() => {
                               if (renderer) {
-                                renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
-                                renderer.render(true)
+                                const hasAnyNodeBeingEdited = !!editingNode.value
+                                
+                                if (hasAnyNodeBeingEdited) {
+                                  // ⚠️ CRITICAL: KHÔNG gọi setData() khi có node đang được edit
+                                  // Chỉ update d3Node.data trực tiếp
+                                  const d3Node = renderer.nodes.find((n) => n.id === remoteNode.id)
+                                  if (d3Node) {
+                                    if (!d3Node.data) d3Node.data = {}
+                                    d3Node.data.rect = { width: newSize.width, height: newSize.height }
+                                    d3Node.data.fixedWidth = newSize.width
+                                    d3Node.data.fixedHeight = newSize.height
+                                  }
+                                  console.log(`[Realtime] ⚠️ Đã cập nhật size nhưng KHÔNG gọi setData/render vì có node đang được edit: ${remoteNode.id}`)
+                                } else {
+                                  renderer.setData(nodes.value, edges.value, nodeCreationOrder.value)
+                                  if (safeRender(renderer, false)) {
+                                    console.log(`[Realtime] ✅ Đã cập nhật size và render lại cho node ${remoteNode.id}: ${newSize.width}x${newSize.height}`)
+                                  }
+                                }
                               }
                             })
                           }, 50)

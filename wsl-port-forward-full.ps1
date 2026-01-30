@@ -2,7 +2,7 @@
 # Run this in PowerShell as Administrator
 
 $wslIp = "172.22.163.122"
-$ports = @(8001, 8080)
+$ports = @(8001, 8080, 9000)
 
 Write-Host "🚀 Configuring port forwarding for WSL2..." -ForegroundColor Cyan
 Write-Host "WSL2 IP: $wslIp" -ForegroundColor Yellow
