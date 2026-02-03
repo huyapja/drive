@@ -362,6 +362,8 @@ const store = useStore()
 const emitter = inject("emitter")
 const socket = inject("socket")
 const suppressPanelAutoFocus = ref(false)
+// ⚠️ FIX: Track các node đã được scale để tránh scale lại (gây loop)
+const scaledNodesAfterImport = ref(new Set())
 provide("suppressPanelAutoFocus", suppressPanelAutoFocus)
 
 // ⚠️ FIX: Tính toán vị trí controls dựa trên trạng thái sidebar
@@ -548,9 +550,11 @@ const {
 const SAVE_DELAY = 1000
 const TEXT_INPUT_SAVE_DELAY = 300
 const TEXT_INPUT_SNAPSHOT_DELAY = 100 // Debounce time để lưu snapshot khi nhập text (dài hơn để tránh tạo quá nhiều snapshots)
+const FORMATTING_SNAPSHOT_DELAY = 300 // Debounce time để lưu snapshot khi formatting (highlight, bold, italic, etc.)
 let saveTimeout = null
 let textInputSaveTimeout = null
 let textInputSnapshotTimeout = null
+let formattingSnapshotTimeout = null
 let nodeFocusTimeouts = []
 let nodeCounter = 0
 let creationOrderCounter = 0
@@ -852,6 +856,9 @@ watch(elements, (newElements) => {
 
 // Initialize mindmap with root node
 initializeMindmap = async (data) => {
+  // ⚠️ FIX: Reset flag khi import lại mindmap để có thể scale lại
+  scaledNodesAfterImport.value.clear()
+  
   if (data.mindmap_data && data.mindmap_data.nodes && data.mindmap_data.nodes.length > 0) {
     // Convert VueFlow format to D3 format
     const loadedNodes = data.mindmap_data.nodes.map(node =>
@@ -1109,11 +1116,17 @@ const initD3Renderer = () => {
 
       // 3. skipSizeCalculation: chỉ lưu không tính lại size (formatting updates)
       if (updates.skipSizeCalculation) {
-      console.log('skipSizeCalculation', updates)
-        // ⚠️ FIX: Lưu snapshot vào undo/redo history cho formatting changes
-        // Formatting changes là thao tác rời rạc (click button bold, italic, etc.)
-        // nên cần lưu snapshot ngay, không giống text typing
-        saveSnapshot()
+        console.log('skipSizeCalculation', updates)
+        // ⚠️ FIX: Lưu snapshot với debounce cho formatting changes để tránh tạo nhiều snapshot
+        // khi highlight hoặc format text (có thể trigger nhiều lần liên tiếp)
+        if (formattingSnapshotTimeout) {
+          clearTimeout(formattingSnapshotTimeout)
+        }
+        formattingSnapshotTimeout = setTimeout(() => {
+          console.log(`[Formatting] 💾 Lưu snapshot sau khi format cho node ${nodeId}`)
+          saveSnapshot()
+          formattingSnapshotTimeout = null
+        }, FORMATTING_SNAPSHOT_DELAY)
         scheduleSave()
         return
       }
@@ -1257,6 +1270,13 @@ const initD3Renderer = () => {
       if (textInputSnapshotTimeout) {
         clearTimeout(textInputSnapshotTimeout)
         textInputSnapshotTimeout = null
+      }
+      
+      // ⚠️ FIX: Clear formatting snapshot timeout khi blur để đảm bảo snapshot được lưu ngay
+      if (formattingSnapshotTimeout) {
+        clearTimeout(formattingSnapshotTimeout)
+        saveSnapshot()
+        formattingSnapshotTimeout = null
       }
       
       // ⚠️ FIX: Không lưu snapshot nếu đang upload ảnh (blur để update height)
@@ -1456,6 +1476,70 @@ const initD3Renderer = () => {
           })
         }, 200) // Delay để đảm bảo editor đã sẵn sàng
       })
+      
+      // ⚠️ FIX: Đợi ảnh load xong và scale node giống như khi insert image
+      // Chỉ scale một lần khi import (tránh loop)
+      if (scaledNodesAfterImport.value.size === 0) {
+        nextTick(() => {
+          setTimeout(() => {
+            if (!d3Renderer) return
+            
+            nodes.value.forEach(node => {
+              if (node.id === 'root') return
+              
+              // ⚠️ FIX: Chỉ scale node chưa được scale
+              if (scaledNodesAfterImport.value.has(node.id)) return
+              
+              const hasImages = node.data?.label?.includes('<img') || node.data?.label?.includes('image-wrapper')
+              if (!hasImages) return
+              
+              const editorInstance = d3Renderer.getEditorInstance?.(node.id)
+              if (!editorInstance) return
+              
+              const editorDOM = editorInstance.view?.dom
+              const editorContent = editorDOM?.querySelector('.mindmap-editor-prose') || editorDOM
+              if (!editorContent) return
+              
+              // Tìm tất cả ảnh trong node
+              const images = editorContent.querySelectorAll('img')
+              if (images.length === 0) return
+              
+              // ⚠️ FIX: Đánh dấu node đang được scale để tránh scale lại
+              scaledNodesAfterImport.value.add(node.id)
+              
+              // Kiểm tra xem ảnh đã load chưa
+              const allImagesLoaded = Array.from(images).every(img => img.complete && img.naturalHeight > 0)
+              
+              if (allImagesLoaded) {
+                // Ảnh đã load, trigger blur ngay để scale node
+                setTimeout(() => {
+                  scaleNodeAfterImageLoad(node.id, editorInstance, editorContent)
+                }, 100)
+              } else {
+                // Đợi ảnh load xong
+                const imageLoadPromises = Array.from(images)
+                  .filter(img => !img.complete || img.naturalHeight === 0)
+                  .map(img => new Promise((resolve) => {
+                    if (img.complete && img.naturalHeight > 0) {
+                      resolve()
+                    } else {
+                      img.addEventListener('load', resolve, { once: true })
+                      img.addEventListener('error', resolve, { once: true })
+                      // Timeout sau 3 giây để không block quá lâu
+                      setTimeout(() => resolve(), 3000)
+                    }
+                  }))
+                
+                Promise.all(imageLoadPromises).then(() => {
+                  setTimeout(() => {
+                    scaleNodeAfterImageLoad(node.id, editorInstance, editorContent)
+                  }, 150)
+                })
+              }
+            })
+          }, 500) // Delay để đảm bảo DOM đã sẵn sàng
+        })
+      }
     },
     onNodeContextMenu: (node, pos) => {
       contextMenuNode.value = node
@@ -1471,6 +1555,74 @@ const initD3Renderer = () => {
   })
 
   updateD3Renderer()
+}
+
+// ⚠️ FIX: Scale node sau khi ảnh load xong (giống như insert image)
+function scaleNodeAfterImageLoad(nodeId, editorInstance, editorContent) {
+  if (!d3Renderer || !nodeId || !editorInstance) return
+  
+  // ⚠️ FIX: Kiểm tra xem node đã được scale chưa để tránh loop
+  if (scaledNodesAfterImport.value.has(nodeId + '_scaled')) {
+    return
+  }
+  
+  const node = nodes.value.find(n => n.id === nodeId)
+  if (!node) return
+  
+  const isRootNode = node.data?.isRoot || node.id === 'root'
+  if (isRootNode) return
+  
+  try {
+    const nodeGroup = d3Renderer.g?.select(`[data-node-id="${nodeId}"]`)
+    if (nodeGroup.empty()) return
+    
+    const foElement = nodeGroup.select('.node-text').node()
+    if (!foElement) return
+    
+    // ⚠️ FIX: Đánh dấu node đã được scale để tránh scale lại
+    scaledNodesAfterImport.value.add(nodeId + '_scaled')
+    
+    // ⚠️ CRITICAL: Xóa fixedWidth/fixedHeight để node có thể tự resize
+    if (node.data) {
+      delete node.data.fixedWidth
+      delete node.data.fixedHeight
+    }
+    
+    // Xóa cache để buộc tính toán lại
+    if (d3Renderer.nodeSizeCache) {
+      d3Renderer.nodeSizeCache.delete(nodeId)
+    }
+    
+    // ⚠️ CRITICAL: Gọi trực tiếp handleEditorBlur để tính toán lại height
+    // handleEditorBlur sẽ đo lại height từ DOM và cập nhật node size (giống như insert image)
+    changedNodeIds.value.add(nodeId)
+    
+    try {
+      d3Renderer.handleEditorBlur(nodeId, foElement, node)
+      
+      // ⚠️ FIX: Đợi handleEditorBlur hoàn tất, sau đó update renderer
+      setTimeout(() => {
+        changedNodeIds.value.add(nodeId)
+        // ⚠️ FIX: Chỉ update renderer một lần, không focus lại để tránh trigger render lại
+        updateD3RendererWithDelay(0)
+      }, 200)
+      
+      console.log(`[Import] ✅ Đã scale node ${nodeId} sau khi ảnh load xong`)
+    } catch (err) {
+      console.error(`[Import] ❌ Lỗi khi gọi handleEditorBlur cho node ${nodeId}:`, err)
+      // Fallback: gọi updateNodeHeight từ Vue component
+      const vueAppEntry = d3Renderer?.vueApps?.get(nodeId)
+      if (vueAppEntry?.instance && typeof vueAppEntry.instance.updateNodeHeight === 'function') {
+        vueAppEntry.instance.updateNodeHeight()
+      }
+      // Vẫn update renderer nếu có lỗi
+      updateD3RendererWithDelay(0)
+    }
+  } catch (err) {
+    console.error(`[Import] ❌ Lỗi khi scale node ${nodeId}:`, err)
+    // ⚠️ FIX: Xóa flag nếu có lỗi để có thể thử lại
+    scaledNodesAfterImport.value.delete(nodeId + '_scaled')
+  }
 }
 
 // Rename function moved to useMindmapUIActions composable
@@ -1554,11 +1706,11 @@ function saveSnapshot(force = false) {
                 : editorLabel
               if (!element.data) element.data = {}
               element.data.label = normalizedLabel
-              console.log(`[Undo/Redo] 📝 Lấy label từ editor.getHTML() cho node ${element.id} khi lưu snapshot:`, {
-                editorLabelLength: normalizedLabel.length,
-                editorLabelPreview: normalizedLabel.substring(0, 100),
-                originalLabelLength: element.data?.label?.length || 0
-              })
+              // console.log(`[Undo/Redo] 📝 Lấy label từ editor.getHTML() cho node ${element.id} khi lưu snapshot:`, {
+              //   editorLabelLength: normalizedLabel.length,
+              //   editorLabelPreview: normalizedLabel.substring(0, 100),
+              //   originalLabelLength: element.data?.label?.length || 0
+              // })
             } else {
               // Editor có nhưng content rỗng, normalize label hiện tại nếu có
               if (element.data?.label && typeof element.data.label === 'string') {
@@ -2337,7 +2489,7 @@ const restoreSnapshot = async (snapshot) => {
       if (!element.data) element.data = {}
       // Luôn set label từ snapshot vào elements.value để đảm bảo không bị mất
       element.data.label = originalLabel
-      console.log(`[Undo/Redo] 🔧 Set label vào elements.value cho node ${element.id} từ snapshot`)
+      // console.log(`[Undo/Redo] 🔧 Set label vào elements.value cho node ${element.id} từ snapshot`)
     }
   })
   
@@ -2354,10 +2506,7 @@ const restoreSnapshot = async (snapshot) => {
           labelPreview: originalLabel.substring(0, 100)
         })
       } else {
-        console.log(`[Undo/Redo] ✅ Node ${node.id} đã có label trong nodes.value:`, {
-          labelLength: node.data.label.length,
-          labelPreview: node.data.label.substring(0, 100)
-        })
+        console.log("")
       }
     }
   })
@@ -3478,7 +3627,7 @@ const handleImportComplete = async () => {
 
 
 const handleBeforeUnload = (e) => {
-  if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout) {
+  if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout || formattingSnapshotTimeout) {
     if (textInputSaveTimeout) {
       clearTimeout(textInputSaveTimeout)
       textInputSaveTimeout = null
@@ -3487,6 +3636,11 @@ const handleBeforeUnload = (e) => {
       clearTimeout(textInputSnapshotTimeout)
       saveSnapshot()
       textInputSnapshotTimeout = null
+    }
+    if (formattingSnapshotTimeout) {
+      clearTimeout(formattingSnapshotTimeout)
+      saveSnapshot()
+      formattingSnapshotTimeout = null
     }
     if (saveTimeout) {
       clearTimeout(saveTimeout)
@@ -3498,7 +3652,7 @@ const handleBeforeUnload = (e) => {
 
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'hidden') {
-    if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout) {
+    if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout || formattingSnapshotTimeout) {
       if (textInputSaveTimeout) {
         clearTimeout(textInputSaveTimeout)
         textInputSaveTimeout = null
@@ -3507,6 +3661,11 @@ const handleVisibilityChange = () => {
         clearTimeout(textInputSnapshotTimeout)
         saveSnapshot()
         textInputSnapshotTimeout = null
+      }
+      if (formattingSnapshotTimeout) {
+        clearTimeout(formattingSnapshotTimeout)
+        saveSnapshot()
+        formattingSnapshotTimeout = null
       }
       if (saveTimeout) {
         clearTimeout(saveTimeout)
@@ -3720,6 +3879,12 @@ onBeforeUnmount(() => {
     clearTimeout(textInputSnapshotTimeout)
     saveSnapshot()
     textInputSnapshotTimeout = null
+  }
+  
+  if (formattingSnapshotTimeout) {
+    clearTimeout(formattingSnapshotTimeout)
+    saveSnapshot()
+    formattingSnapshotTimeout = null
   }
   // ⚠️ NEW: Cleanup socket listeners với safety check
   if (socket) {
@@ -4122,6 +4287,7 @@ async function pasteFromSystemClipboard(targetNodeId) {
     }
 
     nodeCreationOrder.value.set(newNodeId, creationOrderCounter++)
+    changedNodeIds.value.add(newNodeId)
 
     elements.value = [
       ...nodes.value,
@@ -4157,7 +4323,9 @@ async function pasteFromSystemClipboard(targetNodeId) {
       })
     }
 
-    scheduleSave()
+    saveSnapshot()
+    await nextTick()
+    saveNode(newNodeId)
   } catch (error) {
     console.error('Paste from system clipboard failed:', error)
   }
@@ -4215,6 +4383,7 @@ function handlePasteEvent(event) {
 
         // Store creation order
         nodeCreationOrder.value.set(newNodeId, creationOrderCounter++)
+        changedNodeIds.value.add(newNodeId)
 
         // Add node and edge
         elements.value = [
@@ -4228,6 +4397,7 @@ function handlePasteEvent(event) {
 
         if (d3Renderer) {
           d3Renderer.selectedNode = newNodeId
+          d3Renderer.nodeSizeCache?.delete(newNodeId)
         }
         // Auto-focus new node's editor
         nextTick(() => {
@@ -4248,7 +4418,10 @@ function handlePasteEvent(event) {
           }, 30)
         })
 
-        scheduleSave()
+        saveSnapshot()
+        nextTick(() => {
+          saveNode(newNodeId)
+        })
       }
     }
   }
