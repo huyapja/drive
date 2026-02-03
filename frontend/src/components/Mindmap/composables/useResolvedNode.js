@@ -1,5 +1,6 @@
 import { call } from "frappe-ui"
 import { clearHistoryCache } from "../components/cache/mindmapCommentHistoryCache"
+import { generateUUID } from "@/utils/uuid"
 
 function extractTextFromP(html) {
   if (!html) return ""
@@ -36,7 +37,7 @@ export function useResolvedNode({
       node_id: node.id,
       session_index: session,
       history: {
-        node_key: node.node_key || crypto.randomUUID(),
+        node_key: node.node_key || generateUUID(),
         node_created_at: new Date(node.created_at).toISOString(),
         node_title: extractTextFromP(node.data?.label || ""),
         node_position: node.position,

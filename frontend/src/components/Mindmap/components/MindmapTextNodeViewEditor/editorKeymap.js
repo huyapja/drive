@@ -2,6 +2,7 @@ import { TextSelection } from "@tiptap/pm/state"
 import { splitListItem } from "@tiptap/pm/schema-list"
 import { sinkListItem, liftListItem } from "@tiptap/pm/schema-list"
 import { toast } from "@/utils/toasts"
+import { generateUUID } from "@/utils/uuid"
 
 function getCurrentListItem($from, schema) {
   for (let d = $from.depth; d > 0; d--) {
@@ -308,7 +309,7 @@ export function createEditorKeyDown({
         // ==========================
         // CASE 2: CHƯA CÓ LI → TẠO ROOT CHILD ĐẦU
         // ==========================
-        const newNodeId = crypto.randomUUID()
+        const newNodeId = generateUUID()
         flags.isCreatingDraftNode = true
 
         const inlineRootMark = schema.marks.inlineRoot.create({ clean: true })
@@ -395,7 +396,7 @@ export function createEditorKeyDown({
       // - nếu không → hành vi cũ
       // ==============================
       if (isAtEnd) {
-        const newNodeId = crypto.randomUUID()
+        const newNodeId = generateUUID()
         flags.isCreatingDraftNode = true
 
         const current = getCurrentListItem($from, schema)
@@ -492,7 +493,7 @@ export function createEditorKeyDown({
         const { state, dispatch } = view
         const { schema } = state
 
-        const newNodeId = crypto.randomUUID()
+        const newNodeId = generateUUID()
         flags.isCreatingDraftNode = true
 
         // vị trí insert listItem mới
@@ -577,7 +578,7 @@ export function createEditorKeyDown({
         if (!beforeText || !afterText) return false
 
         // 4️⃣ tạo ID mới cho node BEFORE
-        const newNodeId = crypto.randomUUID()
+        const newNodeId = generateUUID()
         flags.isCreatingDraftNode = true
 
         editor.value?.options?.onAddChildNode?.({

@@ -316,6 +316,7 @@ import { useRecentFiles } from "@/composables/useRecentFiles"
 import { setBreadCrumbs } from "@/utils/files"
 import { uploadImageToMindmap } from '@/utils/mindmapImageUpload'
 import { toast } from "@/utils/toasts"
+import { generateUUID } from "@/utils/uuid"
 import { call, createResource } from "frappe-ui"
 import { computed, defineProps, inject, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from "vue"
 import { useStore } from "vuex"
@@ -423,6 +424,18 @@ const mindmap = createResource({
       console.log(`[Collapse] 📖 Loaded ${data.collapsed_nodes.length} collapsed nodes from database:`, data.collapsed_nodes)
     } else {
       collapsedNodesFromDB.value = []
+    }
+    
+    // ⚠️ NEW: Restore editing states từ API response
+    if (data.editing_users && Array.isArray(data.editing_users)) {
+      console.log(`[Editing] 📖 Restoring ${data.editing_users.length} editing states from API:`, data.editing_users)
+      data.editing_users.forEach(({ node_id, user_id, user_name }) => {
+        nodeEditingUsers.value.set(node_id, {
+          userId: user_id,
+          userName: user_name
+        })
+      })
+      console.log(`[Editing] ✅ Restored editing states:`, Array.from(nodeEditingUsers.value.entries()))
     }
     
     initializeMindmap(data)
@@ -576,6 +589,12 @@ const {
   saveNodesBatchResource,
   broadcastEditingResource,
 } = saveOperations
+
+// ⚠️ NEW: Resource để cleanup tất cả editing states của user khi reload/đóng tab
+const cleanupEditingResource = createResource({
+  url: "drive.api.mindmap.cleanup_user_editing_states",
+  method: "POST"
+})
 
 // Setup Toolbar composable (Phase 3)
 const toolbarOperations = useMindmapToolbar({
@@ -924,11 +943,72 @@ initializeMindmap = async (data) => {
   await nextTick()
   if (currentView.value === 'visual') {
     initD3Renderer()
+    // ⚠️ NOTE: restoreEditingIndicators sẽ được gọi trong onRenderComplete callback
   }
   
   // Lưu snapshot ban đầu sau khi khởi tạo mindmap (force = true vì đây là snapshot đầu tiên)
   await nextTick()
   saveSnapshot(true)
+}
+
+// ⚠️ NEW: Restore editing indicators từ nodeEditingUsers sau khi reload
+const restoreEditingIndicators = () => {
+  if (!d3Renderer || !d3Renderer.g) {
+    console.log('[Editing] ⏸️ Renderer chưa sẵn sàng, bỏ qua restore editing indicators')
+    return
+  }
+  
+  const renderer = d3Renderer
+  
+  console.log('[Editing] 🔄 Restoring editing indicators for', nodeEditingUsers.value.size, 'nodes')
+  
+  nodeEditingUsers.value.forEach((editingUser, nodeId) => {
+    const nodeGroup = renderer.g.select(`[data-node-id="${nodeId}"]`)
+    if (!nodeGroup.empty()) {
+      const rect = nodeGroup.select('.node-rect')
+      if (!rect.empty()) {
+        // Apply editing style
+        rect
+          .style('stroke', '#f59e0b')
+          .style('stroke-width', '2px')
+          .attr('stroke-dasharray', '4 2')
+        
+        // Add editing badge if not exists
+        const existingBadge = nodeGroup.select('.editing-badge')
+        if (existingBadge.empty()) {
+          const badge = nodeGroup.append('g')
+            .attr('class', 'editing-badge')
+            .attr('transform', 'translate(10, -15)')
+          
+          const text = badge.append('text')
+            .attr('x', 0)
+            .attr('y', 14)
+            .style('fill', 'white')
+            .style('font-size', '11px')
+            .style('font-weight', 'bold')
+            .text(`${editingUser.userName}`)
+          
+          const textBBox = text.node().getBBox()
+          const padding = 12
+          const badgeWidth = textBBox.width + padding * 2
+          
+          badge.insert('rect', 'text')
+            .attr('width', badgeWidth)
+            .attr('height', 20)
+            .attr('rx', 10)
+            .style('fill', '#f59e0b')
+          
+          text
+            .attr('x', badgeWidth / 2)
+            .attr('text-anchor', 'middle')
+          
+          console.log(`[Editing] ✅ Restored editing indicator for node ${nodeId} (${editingUser.userName})`)
+        }
+      }
+    }
+  })
+  
+  console.log('[Editing] ✅ Finished restoring editing indicators')
 }
 
 // Initialize D3 Renderer
@@ -1460,6 +1540,11 @@ const initD3Renderer = () => {
       // Dừng loading khi render xong
       isRendering.value = false
       isMindmapReady.value = true
+      
+      // ⚠️ NEW: Restore editing indicators sau khi render hoàn tất
+      nextTick(() => {
+        restoreEditingIndicators()
+      })
       
       // ⚠️ NEW: Apply/remove strikethrough cho tất cả nodes dựa trên completed status
       // Cần apply cho cả completed = true (add) và completed = false (remove)
@@ -3627,7 +3712,34 @@ const handleImportComplete = async () => {
 
 
 const handleBeforeUnload = (e) => {
-  if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout || formattingSnapshotTimeout) {
+  // ⚠️ NEW: Cleanup tất cả editing states của user khi reload/đóng tab
+  // Luôn gọi cleanup để đảm bảo xóa editing states của user (kể cả khi không có trong nodeEditingUsers
+  // vì API không trả về editing states của chính user đó)
+  try {
+    const url = `/api/method/drive.api.mindmap.cleanup_user_editing_states`
+    const data = JSON.stringify({
+      entity_name: props.entityName
+    })
+    
+    // Dùng fetch với keepalive để đảm bảo request được gửi khi page unload
+    // sendBeacon không hỗ trợ custom headers (cần CSRF token cho Frappe)
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: data,
+      keepalive: true,
+      credentials: 'include'
+    }).catch(err => {
+      console.error('[Editing] ❌ Failed to cleanup editing states:', err)
+    })
+    console.log('[Editing] 🧹 Sent cleanup request via fetch (keepalive)')
+  } catch (error) {
+    console.error('[Editing] ❌ Error cleaning up editing states:', error)
+  }
+  
+  if (textInputSaveTimeout || saveTimeout || textInputSnapshotTimeout) {
     if (textInputSaveTimeout) {
       clearTimeout(textInputSaveTimeout)
       textInputSaveTimeout = null
@@ -3903,6 +4015,19 @@ onBeforeUnmount(() => {
   socket.off('drive_mindmap:node_resolved', handleRealtimeResolvedComment)
   socket.off('drive_mindmap:node_unresolved', handleRealtimeUnresolvedComment)
   
+  // ⚠️ NEW: Cleanup tất cả editing states của user khi component unmount
+  if (nodeEditingUsers.value.size > 0 || editingNode.value) {
+    try {
+      cleanupEditingResource.submit({
+        entity_name: props.entityName
+      })
+      console.log('[Editing] 🧹 Cleaned up editing states on unmount')
+    } catch (error) {
+      console.error('[Editing] ❌ Error cleaning up editing states:', error)
+    }
+  }
+  
+  // ⚠️ FIX: Vẫn broadcast stop editing cho node hiện tại (backward compatibility)
   if (editingNode.value) {
     broadcastNodeEditing(editingNode.value, false)
   }
@@ -5585,7 +5710,7 @@ async function addChildToNodeTextMode(payload) {
 
       const newNode = {
         id: newNodeId,
-        node_key: crypto.randomUUID(),
+        node_key: generateUUID(),
         created_at: Date.now(),
         data: {
           parentId,
@@ -5645,7 +5770,7 @@ async function addChildToNodeTextMode(payload) {
 
       const newNode = {
         id: newNodeId,
-        node_key: crypto.randomUUID(),
+        node_key: generateUUID(),
         created_at: Date.now(), 
         data: {
           parentId,
