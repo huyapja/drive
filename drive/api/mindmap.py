@@ -140,6 +140,23 @@ def get_mindmap_data(entity_name):
             except:
                 collapsed_nodes = []
 
+        # ⚠️ NEW: Get current editing states from cache
+        cache_key = f"mindmap_editing_{entity_name}"
+        cache = frappe.cache()
+        editing_states = cache.get_value(cache_key) or {}
+        
+        # Convert to list format for frontend
+        editing_users = []
+        current_user_id = frappe.session.user
+        for node_id, state in editing_states.items():
+            # Only return editing states from other users (not current user)
+            if state.get("user_id") != current_user_id:
+                editing_users.append({
+                    "node_id": node_id,
+                    "user_id": state.get("user_id"),
+                    "user_name": state.get("user_name", ""),
+                })
+
         return {
             "name": doc.name,
             "title": doc.title,
@@ -156,6 +173,7 @@ def get_mindmap_data(entity_name):
             "drive_file_name": doc_drive.name,
             "is_private": doc_drive.is_private,
             "collapsed_nodes": collapsed_nodes,  # ⚠️ FIX: Trả về collapsed nodes
+            "editing_users": editing_users,  # ⚠️ NEW: Trả về editing states để restore sau reload
         }
 
     except Exception as e:
@@ -562,15 +580,40 @@ def broadcast_node_editing(entity_name, node_id, is_editing):
         if not frappe.has_permission("Drive File", "read", doc_drive):
             return {"success": False}
 
+        user_name = frappe.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+
         message = {
             "entity_name": entity_name,
             "mindmap_id": doc_drive.mindmap,
             "node_id": node_id,
             "is_editing": is_editing,
             "user_id": frappe.session.user,
-            "user_name": frappe.get_value("User", frappe.session.user, "full_name")
-            or frappe.session.user,
+            "user_name": user_name,
         }
+
+        # ⚠️ NEW: Store editing state in cache để restore sau khi reload
+        cache_key = f"mindmap_editing_{entity_name}"
+        cache = frappe.cache()
+        
+        # Get current editing states
+        editing_states = cache.get_value(cache_key) or {}
+        
+        if is_editing:
+            # Add editing state
+            editing_states[node_id] = {
+                "user_id": frappe.session.user,
+                "user_name": user_name,
+                "timestamp": frappe.utils.now(),
+            }
+        else:
+            # Remove editing state for this user and node
+            if node_id in editing_states:
+                # Only remove if it's the same user
+                if editing_states[node_id].get("user_id") == frappe.session.user:
+                    del editing_states[node_id]
+        
+        # Save back to cache (expires in 5 minutes - if user doesn't send stop signal, it will auto-expire)
+        cache.set_value(cache_key, editing_states, expires_in_sec=300)
 
         try:
             frappe.publish_realtime(
@@ -587,6 +630,82 @@ def broadcast_node_editing(entity_name, node_id, is_editing):
 
     except Exception as e:
         frappe.log_error(f"Broadcast editing: {str(e)[:100]}", "Broadcast Editing")
+        return {"success": False}
+
+
+@frappe.whitelist()
+def cleanup_user_editing_states(entity_name):
+    """
+    Xóa tất cả editing states của user hiện tại khỏi cache
+    Được gọi khi user reload hoặc đóng tab
+
+    :param entity_name: Drive File entity name
+    """
+    try:
+        doc_drive = frappe.get_doc("Drive File", entity_name)
+
+        if not doc_drive or not doc_drive.mindmap:
+            return {"success": False}
+
+        if not frappe.has_permission("Drive File", "read", doc_drive):
+            return {"success": False}
+
+        cache_key = f"mindmap_editing_{entity_name}"
+        cache = frappe.cache()
+        
+        # Get current editing states
+        editing_states = cache.get_value(cache_key) or {}
+        
+        # Find and remove all editing states of current user
+        nodes_to_remove = []
+        nodes_to_broadcast = []
+        
+        for node_id, state in editing_states.items():
+            if state.get("user_id") == frappe.session.user:
+                nodes_to_remove.append(node_id)
+                nodes_to_broadcast.append({
+                    "node_id": node_id,
+                    "user_name": state.get("user_name", ""),
+                })
+        
+        # Remove editing states
+        for node_id in nodes_to_remove:
+            del editing_states[node_id]
+        
+        # Save back to cache
+        cache.set_value(cache_key, editing_states, expires_in_sec=300)
+        
+        # Broadcast stop editing for all nodes
+        user_name = frappe.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+        
+        for node_info in nodes_to_broadcast:
+            try:
+                message = {
+                    "entity_name": entity_name,
+                    "mindmap_id": doc_drive.mindmap,
+                    "node_id": node_info["node_id"],
+                    "is_editing": False,
+                    "user_id": frappe.session.user,
+                    "user_name": user_name,
+                }
+                
+                frappe.publish_realtime(
+                    event="drive_mindmap:node_editing",
+                    message=message,
+                )
+            except Exception as e:
+                frappe.log_error(
+                    f"Error broadcasting cleanup editing status for node {node_info['node_id']}: {str(e)[:100]}",
+                    "Cleanup Editing",
+                )
+        
+        return {
+            "success": True,
+            "cleaned_nodes": len(nodes_to_remove),
+        }
+
+    except Exception as e:
+        frappe.log_error(f"Cleanup editing states: {str(e)[:100]}", "Cleanup Editing")
         return {"success": False}
 
 
